@@ -537,6 +537,55 @@ fn live_transcription_replays_both_recorded_tracks() {
 }
 
 #[test]
+fn live_paste_without_a_moonshine_draft_uses_committed_rolling_entries() {
+    use transcript::{RollingCoverage, RollingLine};
+
+    let directory = std::env::temp_dir().join(format!(
+        "voice-control-meeting-rolling-paste-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let entry = |source, start_ms, end_ms, text: &str| {
+        RollingLine::Entry(TranscriptEntry {
+            source,
+            start_ms,
+            end_ms,
+            text: text.into(),
+        })
+    };
+    let lines = [
+        RollingLine::Coverage {
+            covered_ms: RollingCoverage {
+                system: Some(20_000),
+                microphone: Some(10_000),
+            },
+        },
+        entry(MeetingSource::System, 0, 20_000, "Hola a todos."),
+        entry(MeetingSource::Microphone, 2_000, 9_000, "Buenos días."),
+        entry(MeetingSource::Microphone, 12_000, 15_000, "Esperando."),
+        entry(MeetingSource::System, 20_500, 22_000, "Borrador"),
+    ];
+    let path = directory.join(transcript::ROLLING_FILE);
+    fs::write(
+        &path,
+        lines
+            .iter()
+            .map(|line| serde_json::to_string(line).unwrap() + "\n")
+            .collect::<String>(),
+    )
+    .unwrap();
+    assert_eq!(
+        shown(&live::read_committed_rolling(&path).unwrap()),
+        [
+            (MeetingSource::System, "Hola a todos."),
+            (MeetingSource::Microphone, "Buenos días."),
+        ]
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn rolling_entries_replace_the_live_draft_for_the_time_they_cover() {
     let entry = |source, start_ms, end_ms, text: &str| TranscriptEntry {
         source,
@@ -984,4 +1033,72 @@ fn paste_cursor_counts_coalesced_turns_and_advances_only_on_success() {
 
     // Switching to a new meeting resets the seen set cleanly.
     assert_eq!(cursor.pending_turn_count("meeting-b", &initial), 2);
+}
+
+fn packet_at(source: MeetingSource, arrival_ms: u64, samples: usize) -> AudioPacket {
+    AudioPacket {
+        source,
+        pts_us: None,
+        arrival_us: arrival_ms * 1_000,
+        position: 0,
+        sample_rate: SAMPLE_RATE,
+        samples: vec![0.25; samples],
+    }
+}
+
+#[test]
+fn contiguous_audio_with_jitter_is_not_padded() {
+    let track = TrackManifest {
+        first_arrival_us: Some(100_000),
+        samples: 16_000,
+        ..TrackManifest::default()
+    };
+    // One second of audio held, the next 100 ms packet arrives 300 ms late.
+    let late = packet_at(MeetingSource::Microphone, 1_500, 1_600);
+    assert_eq!(missing_samples(&track, &late), 0);
+}
+
+#[test]
+fn a_source_that_resumes_after_an_outage_is_padded_back_onto_the_timeline() {
+    let track = TrackManifest {
+        first_arrival_us: Some(0),
+        samples: 16_000,
+        ..TrackManifest::default()
+    };
+    // The source went silent after one second and resumed at 11.1 s.
+    let resumed = packet_at(MeetingSource::System, 11_100, 1_600);
+    assert_eq!(missing_samples(&track, &resumed), 160_000);
+}
+
+#[test]
+fn writer_fills_a_capture_gap_with_silence_and_records_it() {
+    let directory = std::env::temp_dir().join(format!(
+        "hex-meeting-gap-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let (sender, receiver) = mpsc::sync_channel(16);
+    for (arrival_ms, source) in [
+        (100, MeetingSource::System),
+        (100, MeetingSource::Microphone),
+        (200, MeetingSource::System),
+        (200, MeetingSource::Microphone),
+        // System audio drops out for five seconds; the microphone continues.
+        (300, MeetingSource::Microphone),
+        (5_300, MeetingSource::System),
+    ] {
+        sender.send(packet_at(source, arrival_ms, 1_600)).unwrap();
+    }
+    drop(sender);
+    let stats = write_tracks(&directory, receiver, None, None, &AtomicU64::new(0)).unwrap();
+    assert_eq!(stats.microphone.samples, 4_800);
+    assert!(stats.microphone.gaps.is_empty());
+    assert_eq!(stats.system.gaps.len(), 1);
+    assert_eq!(stats.system.gaps[0].start_ms, 200);
+    assert_eq!(stats.system.gaps[0].duration_ms, 4_900);
+    assert_eq!(stats.system.samples, 3_200 + 78_400 + 1_600);
+    let wav = WavReader::open(directory.join("system.wav")).unwrap();
+    assert_eq!(u64::from(wav.len()), stats.system.samples);
+    fs::remove_dir_all(directory).unwrap();
 }
