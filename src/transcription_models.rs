@@ -564,6 +564,10 @@ pub(crate) fn choices_for_runtime(language: &str) -> Vec<ModelChoice> {
     }
 }
 
+pub fn use_english_meeting_draft(selection: &TranscriptionSelection) -> bool {
+    matches!(selection.language.as_str(), "en" | AUTO_LANGUAGE)
+}
+
 pub fn validate(selection: &TranscriptionSelection) -> Result<&'static ModelDefinition> {
     if !LANGUAGES
         .iter()
@@ -922,8 +926,8 @@ pub fn language_for_model(model: TranscriptionModelId, preferred: &str) -> Optio
 }
 
 /// The best starting selection for a dictation language: its first
-/// recommended runtime model. Unknown languages fall back to English.
-#[cfg(target_os = "windows")]
+/// recommended runtime model. Unknown languages fall back to English, so an
+/// English system starts with Parakeet Unified English.
 pub fn recommended_selection(language: &str) -> TranscriptionSelection {
     let language = LANGUAGES
         .iter()
@@ -1244,6 +1248,28 @@ mod tests {
         assert_eq!(whisper.runtime_language_hint("fil"), Some("tl"));
         assert_eq!(qwen.runtime_language_hint(AUTO_LANGUAGE), None);
         assert_eq!(qwen.runtime_language_hint("zh"), Some("zh"));
+    }
+
+    #[test]
+    fn spanish_selection_does_not_use_the_english_meeting_draft() {
+        let spanish = TranscriptionSelection {
+            model: TranscriptionModelId::ParakeetV3,
+            language: "es".into(),
+            recognition_hints: String::new(),
+        };
+        let whisper_spanish = TranscriptionSelection {
+            model: TranscriptionModelId::WhisperLargeV3Turbo,
+            language: "es".into(),
+            recognition_hints: String::new(),
+        };
+        assert!(!use_english_meeting_draft(&spanish));
+        assert!(!use_english_meeting_draft(&whisper_spanish));
+        assert!(use_english_meeting_draft(&TranscriptionSelection::default()));
+        assert!(use_english_meeting_draft(&TranscriptionSelection {
+            model: TranscriptionModelId::WhisperLargeV3Turbo,
+            language: AUTO_LANGUAGE.into(),
+            recognition_hints: String::new(),
+        }));
     }
 
     #[test]
